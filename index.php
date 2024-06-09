@@ -21,58 +21,60 @@ class Database
         $stmt->execute(['url' => $url, 'html' => $html]);
     }
 
-    public function saveProgress(int $parsedCount, array $visitedUrls, array $urlsToVisit): void
+    public function saveProgress(int $parsedCount): void
     {
-        $this->pdo->beginTransaction();
-
-        try {
-            $stmt = $this->pdo->prepare('INSERT INTO index_progress (id, parsed_count) VALUES (1, :parsed_count) ON CONFLICT (id) DO UPDATE SET parsed_count = :parsed_count');
-            $stmt->execute(['parsed_count' => $parsedCount]);
-
-            $this->pdo->exec('DELETE FROM visited_urls');
-            foreach ($visitedUrls as $visitedUrl) {
-                $stmt = $this->pdo->prepare('INSERT INTO visited_urls (url) VALUES (:url)');
-                $stmt->execute(['url' => $visitedUrl]);
-            }
-
-            $this->pdo->exec('DELETE FROM urls_to_visit');
-            foreach ($urlsToVisit as $urlToVisit) {
-                $stmt = $this->pdo->prepare('INSERT INTO urls_to_visit (url) VALUES (:url)');
-                $stmt->execute(['url' => $urlToVisit]);
-            }
-
-            $this->pdo->commit();
-        } catch (PDOException $e) {
-            $this->pdo->rollBack();
-            echo "Database error: " . $e->getMessage() . "\n";
-        }
+        $stmt = $this->pdo->prepare('INSERT INTO index_progress (id, parsed_count) VALUES (1, :parsed_count) ON CONFLICT (id) DO UPDATE SET parsed_count = :parsed_count');
+        $stmt->execute(['parsed_count' => $parsedCount]);
     }
 
-    public function restoreProgress(): ?array
+    public function restoreProgress(): ?int
     {
-        try {
-            $stmt = $this->pdo->query('SELECT parsed_count FROM index_progress WHERE id = 1');
-            $progress = $stmt->fetch() ?: null;
+        $stmt = $this->pdo->query('SELECT parsed_count FROM index_progress WHERE id = 1');
+        $progress = $stmt->fetch();
+        return $progress ? (int) $progress['parsed_count'] : null;
+    }
 
-            $visitedUrlsStmt = $this->pdo->query('SELECT url FROM visited_urls');
-            $visitedUrls = $visitedUrlsStmt->fetchAll(PDO::FETCH_COLUMN);
+    public function isUrlVisited(string $url): bool
+    {
+        $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM visited_urls WHERE url = :url');
+        $stmt->execute(['url' => $url]);
+        return (bool) $stmt->fetchColumn();
+    }
 
-            $urlsToVisitStmt = $this->pdo->query('SELECT url FROM urls_to_visit');
-            $urlsToVisit = $urlsToVisitStmt->fetchAll(PDO::FETCH_COLUMN);
+    public function isUrlToVisit(string $url): bool
+    {
+        $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM urls_to_visit WHERE url = :url');
+        $stmt->execute(['url' => $url]);
+        return (bool) $stmt->fetchColumn();
+    }
 
-            if ($progress) {
-                return [
-                    'parsedCount' => (int) $progress['parsed_count'],
-                    'visitedUrls' => $visitedUrls,
-                    'urlsToVisit' => $urlsToVisit,
-                ];
-            }
+    public function addUrlToVisit(string $url): void
+    {
+        $stmt = $this->pdo->prepare('INSERT INTO urls_to_visit (url) VALUES (:url) ON CONFLICT DO NOTHING');
+        $stmt->execute(['url' => $url]);
+    }
 
-            return null;
-        } catch (PDOException $e) {
-            echo "Database error: " . $e->getMessage() . "\n";
-            return null;
+    public function addUrlVisited(string $url): void
+    {
+        $stmt = $this->pdo->prepare('INSERT INTO visited_urls (url) VALUES (:url) ON CONFLICT DO NOTHING');
+        $stmt->execute(['url' => $url]);
+    }
+
+    public function getNextUrlToVisit(): ?string
+    {
+        $stmt = $this->pdo->query('SELECT url FROM urls_to_visit LIMIT 1');
+        $url = $stmt->fetchColumn();
+        if ($url) {
+            $this->removeUrlToVisit($url);
+            return $url;
         }
+        return null;
+    }
+
+    public function removeUrlToVisit(string $url): void
+    {
+        $stmt = $this->pdo->prepare('DELETE FROM urls_to_visit WHERE url = :url');
+        $stmt->execute(['url' => $url]);
     }
 }
 
@@ -263,8 +265,6 @@ class LinkParser
 
 class SiteIndexer
 {
-    private array $visitedUrls = [];
-    private array $urlsToVisit = [];
     private int $parsedCount = 0;
 
     public function __construct(
@@ -278,32 +278,28 @@ class SiteIndexer
     {
         $progressData = $this->db->restoreProgress();
 
-        if ($progressData) {
-            $this->parsedCount = $progressData['parsedCount'];
-            $this->visitedUrls = $progressData['visitedUrls'];
-            $this->urlsToVisit = $progressData['urlsToVisit'];
+        if ($progressData !== null) {
+            $this->parsedCount = $progressData;
             echo "Resuming from last saved progress.\n";
         } else {
-            $this->urlsToVisit[] = $startUrl;
+            $this->db->addUrlToVisit($startUrl);
         }
 
-        while (!empty($this->urlsToVisit)) {
-            $url = array_shift($this->urlsToVisit);
+        while ($url = $this->db->getNextUrlToVisit()) {
             $this->indexSite($url);
         }
     }
 
     private function indexSite(string $url, int $depth = 2): void
     {
-        if ($depth === 0 || in_array($url, $this->visitedUrls, true)) {
+        if ($depth === 0 || $this->db->isUrlVisited($url)) {
             return;
         }
 
-        $this->visitedUrls[] = $url;
+        $this->db->addUrlVisited($url);
         $this->parsedCount++;
         echo "Indexing: $url\n";
         echo "Parsed URLs: $this->parsedCount\n";
-        echo "Remaining URLs: " . count($this->urlsToVisit) . "\n";
 
         $html = $this->fetcher->getPage($url);
         if ($html === null) {
@@ -311,12 +307,12 @@ class SiteIndexer
         }
 
         $this->db->savePage($url, $html);
-        $this->db->saveProgress($this->parsedCount, $this->visitedUrls, $this->urlsToVisit);
+        $this->db->saveProgress($this->parsedCount);
 
         $links = $this->parser->parseLinks($html, $url);
         foreach ($links as $link) {
-            if (!in_array($link, $this->visitedUrls, true) && !in_array($link, $this->urlsToVisit, true)) {
-                $this->urlsToVisit[] = $link;
+            if (!$this->db->isUrlVisited($link) && !$this->db->isUrlToVisit($link)) {
+                $this->db->addUrlToVisit($link);
             }
         }
 
